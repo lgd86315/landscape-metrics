@@ -1,0 +1,115 @@
+import os  # Handles file and directory operations
+import numpy as np  # Performs numerical computations
+import rasterio  # Reads, manipulates, and writes raster data
+from skimage.measure import label, regionprops  # For analyzing labeled regions (patches)
+
+# Function to calculate the total edge length of patches in raster data
+def calculate_total_edge_length(data, no_data_value=15):
+    rows, cols = data.shape  # Get the dimensions of the raster
+    total_edge_length = 0  # Initialize edge length
+
+    # Loop through each pixel in the raster
+    for i in range(rows):
+        for j in range(cols):
+            if data[i, j] != 0:  # Only consider non-zero pixels
+                # Check the top neighbor
+                if i > 0 and data[i - 1, j] != data[i, j] and data[i - 1, j] != no_data_value:
+                    total_edge_length += 1
+                # Check the bottom neighbor
+                if i < rows - 1 and data[i + 1, j] != data[i, j] and data[i + 1, j] != no_data_value:
+                    total_edge_length += 1
+                # Check the left neighbor
+                if j > 0 and data[i, j - 1] != data[i, j] and data[i, j - 1] != no_data_value:
+                    total_edge_length += 1
+                # Check the right neighbor
+                if j < cols - 1 and data[i, j + 1] != data[i, j] and data[i, j + 1] != no_data_value:
+                    total_edge_length += 1
+
+    return total_edge_length / 2  # Divide by 2 to avoid double counting
+
+# Function to calculate landscape metrics within a raster window
+def calculate_indices_in_window(data, pixel_size, no_data_value=15):
+    data[data == no_data_value] = 0  # Replace no-data values with 0
+    labeled_image, num_patches = label(data, return_num=True)  # Label patches in the raster
+
+    regions = regionprops(labeled_image)  # Get properties of each patch
+    patch_areas = [region.area * (pixel_size ** 2) for region in regions]  # Calculate patch areas
+    total_edge_length = calculate_total_edge_length(data, no_data_value) * pixel_size  # Total edge length
+    total_area = data.size * (pixel_size ** 2)  # Total area of the raster
+
+    # Calculate landscape indices
+    PD = (num_patches / total_area) * 1000000  # Patch Density
+    ED = (total_edge_length / total_area) * 10000  # Edge Density
+    AREA_MN = np.mean(patch_areas) / 10000 if patch_areas else 0  # Mean Patch Area
+
+    # Calculate Mesh Size (MESH)
+    if total_area == 0 or len(patch_areas) == 0:
+        MESH = 0
+    else:
+        sum_a = sum(int(area) ** 2 for area in patch_areas)
+        MESH = (sum_a / total_area) * (1 / 10000)
+
+    return PD, ED, AREA_MN, MESH  # Return the indices
+
+# Function to create rasters for each index
+def create_indices_raster(image_path, output_folder, window_size=1000, pixel_size=30):
+    with rasterio.open(image_path) as src:  # Open the raster file
+        raster = src.read(1)  # Read the first band of the raster
+        rows, cols = raster.shape  # Get the dimensions of the raster
+
+        # Calculate the number of pixels per window
+        num_rows = int(window_size / pixel_size)
+        num_cols = int(window_size / pixel_size)
+
+        # Initialize arrays to store index values
+        PD_raster = np.zeros((rows, cols))
+        ED_raster = np.zeros((rows, cols))
+        AREA_MN_raster = np.zeros((rows, cols))
+        MESH_raster = np.zeros((rows, cols))
+
+        # Loop through the raster in windows
+        for i in range(0, rows, num_rows):
+            for j in range(0, cols, num_cols):
+                window = raster[i:i + num_rows, j:j + num_cols]  # Extract a window
+                if window.size == 0:
+                    continue
+                # Calculate indices for the window
+                PD, ED, AREA_MN, MESH = calculate_indices_in_window(window, pixel_size, no_data_value=15)
+
+                # Assign the calculated indices to the corresponding raster
+                PD_raster[i:i + num_rows, j:j + num_cols] = PD
+                ED_raster[i:i + num_rows, j:j + num_cols] = ED
+                AREA_MN_raster[i:i + num_rows, j:j + num_cols] = AREA_MN
+                MESH_raster[i:i + num_rows, j:j + num_cols] = MESH
+
+        profile = src.profile  # Get the raster's metadata
+        profile.update(dtype=rasterio.float32)  # Update the data type to float32
+
+        # Create output file paths
+        base_filename = os.path.splitext(os.path.basename(image_path))[0]
+        pd_output_path = os.path.join(output_folder, f'{base_filename}_PD_raster.tif')
+        ed_output_path = os.path.join(output_folder, f'{base_filename}_ED_raster.tif')
+        area_mn_output_path = os.path.join(output_folder, f'{base_filename}_AREA_MN_raster.tif')
+        mesh_output_path = os.path.join(output_folder, f'{base_filename}_MESH_raster.tif')
+
+        # Write each index raster to a GeoTIFF file
+        with rasterio.open(pd_output_path, 'w', **profile) as dst:
+            dst.write(PD_raster.astype(rasterio.float32), 1)
+        with rasterio.open(ed_output_path, 'w', **profile) as dst:
+            dst.write(ED_raster.astype(rasterio.float32), 1)
+        with rasterio.open(area_mn_output_path, 'w', **profile) as dst:
+            dst.write(AREA_MN_raster.astype(rasterio.float32), 1)
+        with rasterio.open(mesh_output_path, 'w', **profile) as dst:
+            dst.write(MESH_raster.astype(rasterio.float32), 1)
+
+# Function to process all raster files in a folder
+def process_folder(input_folder, output_folder):
+    for filename in os.listdir(input_folder):  # Loop through files in the input folder
+        if filename.endswith('.tif'):  # Process only GeoTIFF files
+            image_path = os.path.join(input_folder, filename)  # Get the file path
+            create_indices_raster(image_path, output_folder)  # Create index rasters
+
+# Example usage
+input_folder = r'F:\AGLC_2000_LC'  # Folder containing input rasters
+output_folder = r'F:\AGLC_2000_LC_result'  # Folder to save the output rasters
+process_folder(input_folder, output_folder)  # Process all rasters in the input folder
